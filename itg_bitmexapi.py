@@ -3,6 +3,8 @@ import datetime
 import hashlib
 import hmac
 import json
+import logging
+import logging.handlers
 import ssl
 import urllib
 import urllib.parse
@@ -231,6 +233,53 @@ class BitmexUtil:
             'available_balance': available,
         }
 
+
+    class WsRecentData:
+        """
+        웹소켓 데이터 수신시 테이블별 데이터 관리
+        """
+        def __init__(self):
+            self.data = {}
+            self.key = {}
+            # 기본 로깅 세팅
+            self.logger = logging.getLogger(self.__class__.__name__)
+            self.logger.addHandler(logging.StreamHandler())
+            self.logger.setLevel(logging.DEBUG)
+
+        def _gen_key(self, table, data_itm):
+            k = ''
+            for key in self.key[table]:
+                k += str(data_itm[key])
+            return k
+
+        def put_message(self, msg_txt):
+            msg = json.loads(msg_txt)
+
+            # multiplexing
+            if 'subscribe' in msg:
+                self.logger.info('subscribe to: %s' % msg['subscribe'])
+            elif 'error' in msg:
+                self.logger.error('error : %s' % msg['error'])
+            elif 'table' in msg:
+                table = msg['table']
+                action = msg[
+                    'action']  # 'partial' | 'update' | 'insert' | 'delete',
+                # 테이블이 데이터 딕셔너리에 없을떄
+                if table not in self.data:
+                    self.data[table] = {}  # 생성
+
+                if action == 'partial':
+                    self.key[table] = msg['keys']
+
+                for itm in msg['data']:
+                    gen_key = self._gen_key(table, itm)
+
+                    if action == 'delete':
+                        del self.data[table][gen_key]
+                    else:
+                        self.data[table][gen_key] = itm
+            else:
+                pass
 
 if __name__ == "__main__":
     apikey = 'write_your_apikey'
