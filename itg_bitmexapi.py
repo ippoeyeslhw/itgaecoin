@@ -11,6 +11,7 @@ import urllib.parse
 import urllib.request
 import threading
 import queue
+import http.client
 
 import websocket  # 3rd party lib(https://pypi.python.org/pypi/websocket-client)
 
@@ -41,6 +42,9 @@ class BitmexAPI:
         self.base_url = 'https://www.bitmex.com'
         self.base_pre = '/api/v1'
         self.ordid_factory = _ordid_factory
+        self.x_limit = 0
+        self.x_remain =0
+        self.x_reset = 0
 
     def _req(self, method, path, query_dict, body_dict, is_auth):
         rq_header = {
@@ -79,7 +83,12 @@ class BitmexAPI:
             req = urllib.request.Request(url_str, method=method,
                                          headers=rq_header,
                                          data=body_str.encode('utf-8'))
-        res = urllib.request.urlopen(req)
+        res = urllib.request.urlopen(req) # type: http.client.HTTPResponse
+
+        self.x_limit = res.getheader('x-ratelimit-limit')
+        self.x_remain = res.getheader('x-ratelimit-remaining')
+        self.x_reset = res.getheader('x-ratelimit-reset')
+
         return res
 
     # https://www.bitmex.com/api/explorer/
@@ -115,7 +124,7 @@ class BitmexAPI:
             'price': price,
             'clOrdID': self.ordid_factory.get_ordid(' ', symbol, price),
         }
-        if is_post_only:
+        if is_post_only: # 테이킹 주문 방지 (무조건 메이커)
             order['execInst'] = 'ParticipateDoNotInitiate'
 
         res = self._req('POST', '/order', None, order, True)
@@ -133,7 +142,7 @@ class BitmexAPI:
                 'price': price,
                 'clOrdID': self.ordid_factory.get_ordid(str(i), symbol, price),
             }
-            if is_post_only:
+            if is_post_only: # 테이킹 주문 방지 (무조건 메이커)
                 order['execInst'] = 'ParticipateDoNotInitiate'
             bulk.append(order)
         orders = {
@@ -233,6 +242,20 @@ class BitmexUtil:
             'available_balance': available,
         }
 
+    @classmethod
+    def join_topics(cls, topics, symbol='XBTUSD'):
+        return [itm + ':'+ symbol if itm != 'wallet' else itm for itm in topics]
+
+    @classmethod
+    def normal_topics(cls, symbol='XBTUSD'):
+        topics = [
+            'position',
+            'order',
+            'execution',
+            'wallet',
+            'orderBookL2'
+        ]
+        return BitmexUtil.join_topics(topics, symbol)
 
     class WsRecentData:
         """
@@ -271,13 +294,16 @@ class BitmexUtil:
                 if action == 'partial':
                     self.key[table] = msg['keys']
 
-                for itm in msg['data']:
-                    gen_key = self._gen_key(table, itm)
+                if table in self.key:
+                    for itm in msg['data']:
+                        gen_key = self._gen_key(table, itm)
 
-                    if action == 'delete':
-                        del self.data[table][gen_key]
-                    else:
-                        self.data[table][gen_key] = itm
+                        if action == 'delete':
+                            del self.data[table][gen_key]
+                        else:
+                            self.data[table][gen_key] = itm
+                else:
+                    self.logger.error('error : %s  not in self.key' % table)
             else:
                 pass
 
@@ -292,7 +318,7 @@ if __name__ == "__main__":
     wapi = BitmexWebsocket(apikey, secret)
     msg_q = wapi.get_message_queue()
     wapi.run_with_topics(
-        ['position', 'order', 'execution', 'wallet'])
+        ['position', 'order', 'execution', 'wallet', 'orderBookL2'])
 
     while True:
         itm = msg_q.get()  # blocking
