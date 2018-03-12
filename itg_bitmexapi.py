@@ -3,8 +3,6 @@ import datetime
 import hashlib
 import hmac
 import json
-import logging
-import logging.handlers
 import ssl
 import urllib
 import urllib.parse
@@ -12,39 +10,31 @@ import urllib.request
 import threading
 import queue
 import http.client
-
+import bisect
 import websocket  # 3rd party lib(https://pypi.python.org/pypi/websocket-client)
 
 
-# 간단한 ORDID 생성
-class SimpleOrdIDFactory:
-    @staticmethod
-    def get_ordid(pre, symbol='simple', price=0):
-        prefix = '%s,%s,%s,' % (pre, symbol, str(price))
-        postfix = int(datetime.datetime.now().timestamp() * 1000)
-        return prefix + str(postfix)
 
 
 class BitmexAPI:
     """
     Bitmex Rest API 클래스
     apikey, secret 을 넣어 생성
-    ordid_factory는 get_ordid 메서드가 구현된 것으로 커스텀 주문ID를 생성하는 객체
 
     메소드는 Method 와 path 의 조합이며 '_'로 구분됨
     구현되지 않은 API들은 url 참조하여 직접 작성
     모두 블로킹 모드로 작동
     """
 
-    def __init__(self, _apikey, _secret, _ordid_factory=SimpleOrdIDFactory()):
+    def __init__(self, _apikey, _secret):
         self.apikey = _apikey
         self.secret = _secret
         self.base_url = 'https://www.bitmex.com'
         self.base_pre = '/api/v1'
-        self.ordid_factory = _ordid_factory
         self.x_limit = 0
         self.x_remain =0
         self.x_reset = 0
+        self.last_status = 200
 
     def _req(self, method, path, query_dict, body_dict, is_auth):
         rq_header = {
@@ -85,6 +75,8 @@ class BitmexAPI:
                                          data=body_str.encode('utf-8'))
         res = urllib.request.urlopen(req) # type: http.client.HTTPResponse
 
+        self.last_status = res.status
+
         self.x_limit = res.getheader('x-ratelimit-limit')
         self.x_remain = res.getheader('x-ratelimit-remaining')
         self.x_reset = res.getheader('x-ratelimit-reset')
@@ -122,7 +114,6 @@ class BitmexAPI:
             'symbol': symbol,
             'orderQty': order_qty,
             'price': price,
-            'clOrdID': self.ordid_factory.get_ordid(' ', symbol, price),
         }
         if is_post_only: # 테이킹 주문 방지 (무조건 메이커)
             order['execInst'] = 'ParticipateDoNotInitiate'
@@ -140,7 +131,6 @@ class BitmexAPI:
                 'symbol': symbol,
                 'orderQty': order_qty,
                 'price': price,
-                'clOrdID': self.ordid_factory.get_ordid(str(i), symbol, price),
             }
             if is_post_only: # 테이킹 주문 방지 (무조건 메이커)
                 order['execInst'] = 'ParticipateDoNotInitiate'
@@ -154,6 +144,10 @@ class BitmexAPI:
 
 
 class BitmexWebsocket:
+    """
+    웹소켓 API구현, 바로 Auth를 실시하므로 apikey, secret 정확히 넣어줄 것,
+    실시간 수신데이터는 백그라운드 스레드에서 Queue에 담는다.
+    """
     def __init__(self, _apikey, _secret, _get_queue=queue.Queue()):
         self.base_url = 'wss://www.bitmex.com/realtime'
         self.ws = None  # type: websocket.WebSocketApp
@@ -184,7 +178,7 @@ class BitmexWebsocket:
         th.start()
 
     def _run_forever(self):
-        self.ws.run_forever(sslopt={"cert_reqs": ssl.CERT_NONE})
+        self.ws.run_forever(sslopt={"cert_reqs": ssl.CERT_OPTIONAL})
 
     def send_message(self, op, args):
         self.ws.send(json.dumps({'op': op, 'args': args}))
@@ -223,24 +217,6 @@ class BitmexUtil:
                              digestmod=hashlib.sha256).hexdigest()
         return signature
 
-    @classmethod
-    def front_wallet(cls, position_json, user_wallet_json):
-        """
-        웹 프론트에 있는 wallet 구현
-        """
-        amount = user_wallet_json['amount']
-        real_pnl = position_json['realisedPnl']
-        unreal_pnl = position_json['unrealisedPnl']
-        pos_margin = position_json['maintMargin']
-        available = amount + real_pnl + unreal_pnl - pos_margin
-
-        return {
-            'wallet_balance': amount + real_pnl,
-            'unrealize_pnl': unreal_pnl,
-            'margin_balance': amount + real_pnl + unreal_pnl,
-            'position_margin': pos_margin,
-            'available_balance': available,
-        }
 
     @classmethod
     def join_topics(cls, topics, symbol='XBTUSD'):
@@ -253,59 +229,209 @@ class BitmexUtil:
             'order',
             'execution',
             'wallet',
-            'orderBookL2'
+            'orderBookL2',
+            'trade'
         ]
         return BitmexUtil.join_topics(topics, symbol)
 
-    class WsRecentData:
+    class WsBalance:
         """
-        웹소켓 데이터 수신시 테이블별 데이터 관리
+        웹소켓 실시간수신 데이터로 구현되는 잔고
+        (주의점: wallet 과 position은 partial 후 update 만 된다는 것을 전제함
+         account, currency 가 wallet, position 공통 키이지만 현재 두개는 고정값이므로
+         향후 빗맥이 여러 코인을 지원하게 될 때 수정할 것, 현재는 Xbt(비트코인) 하나뿐이다.)
         """
         def __init__(self):
-            self.data = {}
-            self.key = {}
-            # 기본 로깅 세팅
-            self.logger = logging.getLogger(self.__class__.__name__)
-            self.logger.addHandler(logging.StreamHandler())
-            self.logger.setLevel(logging.DEBUG)
+            self.wallet = {}    #  key: account, currency
+            self.positions = {} #  key: account, currency, symbol
 
-        def _gen_key(self, table, data_itm):
-            k = ''
-            for key in self.key[table]:
-                k += str(data_itm[key])
-            return k
+        def plexing(self, table, action, d):
+            if 'wallet' == table:
+                d = d['data'][0]  # re - assign
+                if 'partial' == action:
+                    self.wallet = d
+                elif 'update' == action:
+                    for k in d.keys():
+                        self.wallet[k] = d[k]
 
-        def put_message(self, msg_txt):
-            msg = json.loads(msg_txt)
+            if 'position' == table:
+                if 'partial' == action:
+                    for t in d['data']:
+                        self.positions[t['symbol']] = t
+                elif 'update' == action:
+                    for t in d['data']:
+                        for k in t.keys():
+                            self.positions[t['symbol']][k] = t[k]
 
-            # multiplexing
-            if 'subscribe' in msg:
-                self.logger.info('subscribe to: %s' % msg['subscribe'])
-            elif 'error' in msg:
-                self.logger.error('error : %s' % msg['error'])
-            elif 'table' in msg:
-                table = msg['table']
-                action = msg[
-                    'action']  # 'partial' | 'update' | 'insert' | 'delete',
-                # 테이블이 데이터 딕셔너리에 없을떄
-                if table not in self.data:
-                    self.data[table] = {}  # 생성
-
-                if action == 'partial':
-                    self.key[table] = msg['keys']
-
-                if table in self.key:
-                    for itm in msg['data']:
-                        gen_key = self._gen_key(table, itm)
-
-                        if action == 'delete':
-                            del self.data[table][gen_key]
-                        else:
-                            self.data[table][gen_key] = itm
-                else:
-                    self.logger.error('error : %s  not in self.key' % table)
+        def front_wallet_keys(self):
+            return [
+                'wallet_balance',
+                'unrealize_pnl',
+                'margin_balance',
+                'position_margin',
+                'available_balance',
+            ]
+        def front_wallet(self):
+            """
+            웹 프론트에 있는 wallet 구현
+            """
+            if 'amount' not in self.wallet:
+                amount = 0
             else:
-                pass
+                amount = self.wallet['amount']
+
+            real_pnl = 0
+            unreal_pnl = 0
+            pos_margin = 0
+
+            for k in self.positions.keys():
+                real_pnl += self.positions[k]['realisedPnl']
+                unreal_pnl += self.positions[k]['unrealisedPnl']
+                pos_margin += self.positions[k]['maintMargin']
+
+            available = amount + real_pnl + unreal_pnl - pos_margin
+
+            return {
+                'wallet_balance': amount + real_pnl,
+                'unrealize_pnl': unreal_pnl,
+                'margin_balance': amount + real_pnl + unreal_pnl,
+                'position_margin': pos_margin,
+                'available_balance': available,
+            }
+
+
+    class WsOrderBooks:
+        """
+        거래상품별 오더북 집합, 실시간수신 데이터를 넣으면 분류하여 오더북생성
+        """
+        def __init__(self):
+            self.books = {}
+
+        def plexing(self, table, action, d):
+            if 'orderBookL2' == table:
+                for t in d['data']:
+                    symbol = t['symbol']
+                    if symbol not in self.books:
+                        self.books[symbol] = BitmexUtil.WsOrderBook(symbol)
+
+                    if action == 'delete':
+                        self.books[symbol].delete(t['id'], t['side'])
+                    elif action == 'update':
+                        self.books[symbol].update(t['id'], t['side'], t['size'])
+                    else:
+                        self.books[symbol].insert(t['id'], t['side'], t['price'], t['size'])
+
+        def gen_buys(self, symbol, limit=20):
+            """
+            지정한 심볼의 1차 ~ limit차 매수호가 제네레이터 (가격,수량,누적)
+            """
+            if symbol not in self.books:
+                return
+            accum = 0
+            for pr, qty in self.books[symbol].gen_buys(limit):
+                accum += qty
+                yield pr, qty, accum
+
+        def gen_slls(self, symbol, limit=20):
+            """
+            지정한 심볼의 1차 ~ limit차 매도호가 제네레이터 (가격,수량,누적)
+            """
+            if symbol not in self.books:
+                return
+            accum = 0
+            for pr, qty in self.books[symbol].gen_slls(limit):
+                accum += qty
+                yield pr, qty, accum
+
+    class WsOrderBook:
+        """
+        오더북 구현, 기본적으로 id 별로 주문을 구분하되, 가격순 정렬을 유지하여
+        근접호가 빠른 접근 가능,
+        (주의점: 기본 binary search사용, 높은빈도의 slicing, 수신데이터 정합성 체크하지 않음)
+        """
+        def __init__(self, symbol='XBTUSD'):
+            self.symbol = symbol
+            self.buy_pr = []  # sorted
+            self.buy_id = []
+            self.sll_pr = []  # sorted
+            self.sll_id = []
+            self.buy_orders = {}  # key: iid, {'price':float, 'size':int}
+            self.sll_orders = {}  # key: iid, {'price':float, 'size':int}
+
+        def insert(self, iid, side, price, size):
+            if side == 'Buy':
+                lens = len(self.buy_pr)
+                idx = bisect.bisect_left(self.buy_pr, price) # O(logN)
+                if lens > 0 and idx < lens:
+                    if self.buy_pr[idx] == price:  # already exist
+                        print('already exist')
+                        return
+                self.buy_pr = self.buy_pr[0:idx] + [price] + self.buy_pr[idx:lens]
+                self.buy_id = self.buy_id[0:idx] + [iid] + self.buy_id[idx:lens]
+                self.buy_orders[iid] = {'price': price, 'size': size}
+            else:
+                lens = len(self.sll_pr)
+                idx = bisect.bisect_left(self.sll_pr, price)
+                if lens > 0 and idx < lens:
+                    if self.sll_pr[idx] == price:  # already exist
+                        print('already exist')
+                        return
+                self.sll_pr = self.sll_pr[0:idx] + [price] + self.sll_pr[idx:lens]
+                self.sll_id = self.sll_id[0:idx] + [iid] + self.sll_id[idx:lens]
+                self.sll_orders[iid] = {'price': price, 'size': size}
+
+        def update(self, iid, side, size):
+            if side == 'Buy':
+                if iid in self.buy_orders:
+                    self.buy_orders[iid]['size'] = size
+            else:
+                if iid in self.sll_orders:
+                    self.sll_orders[iid]['size'] = size
+
+        def delete(self, iid, side):
+            if side == 'Buy':
+                if iid in self.buy_orders:
+                    pass
+                else:
+                    return
+                lens = len(self.buy_pr)
+                price = self.buy_orders[iid]['price']
+                idx = bisect.bisect_left(self.buy_pr, price)
+                if lens > 0 and idx < lens:
+                    if self.buy_pr[idx] == price:  # exist
+                        self.buy_pr = self.buy_pr[0:idx] + self.buy_pr[idx + 1:lens]
+                        self.buy_id = self.buy_id[0:idx] + self.buy_id[idx + 1:lens]
+                        self.buy_orders.pop(iid, None)
+            else:
+                if iid in self.sll_orders:
+                    pass
+                else:
+                    return
+                lens = len(self.sll_pr)
+                price = self.sll_orders[iid]['price']
+                idx = bisect.bisect_left(self.sll_pr, price)
+                if lens > 0 and idx < lens:
+                    if self.sll_pr[idx] == price:  # exist
+                        self.sll_pr = self.sll_pr[0:idx] + self.sll_pr[idx + 1:lens]
+                        self.sll_id = self.sll_id[0:idx] + self.sll_id[idx + 1:lens]
+                        self.sll_orders.pop(iid, None)
+
+        def gen_buys(self, limit=20):
+            lens = len(self.buy_pr)
+            for i, pr in enumerate(reversed(self.buy_pr)):
+                if i < limit:
+                    yield pr, self.buy_orders[self.buy_id[lens - i - 1]]['size']
+                else:
+                    break
+
+        def gen_slls(self, limit=20):
+            for i, pr in enumerate(self.sll_pr):
+                if i < limit:
+                    yield pr, self.sll_orders[self.sll_id[i]]['size']
+                else:
+                    break
+
+
 
 if __name__ == "__main__":
     apikey = 'write_your_apikey'
